@@ -70,6 +70,7 @@ OwnedVector<WasmValue> MakeDefaultInterpreterArguments(Isolate* isolate,
         break;
       case ValueType::kRef:
       case ValueType::kRtt:
+      case ValueType::kRttWithDepth:
       case ValueType::kI8:
       case ValueType::kI16:
       case ValueType::kStmt:
@@ -104,6 +105,7 @@ OwnedVector<Handle<Object>> MakeDefaultArguments(Isolate* isolate,
         break;
       case ValueType::kRef:
       case ValueType::kRtt:
+      case ValueType::kRttWithDepth:
       case ValueType::kI8:
       case ValueType::kI16:
       case ValueType::kStmt:
@@ -237,6 +239,13 @@ int32_t CallWasmFunctionForTesting(Isolate* isolate,
     return -1;
   }
   Handle<Object> result = retval.ToHandleChecked();
+
+  // Multi-value returns, get the first return value (see InterpretWasmModule).
+  if (result->IsJSArray()) {
+    auto receiver = Handle<JSReceiver>::cast(result);
+    result = JSObject::GetElement(isolate, receiver, 0).ToHandleChecked();
+  }
+
   if (result->IsSmi()) {
     return Smi::ToInt(*result);
   }

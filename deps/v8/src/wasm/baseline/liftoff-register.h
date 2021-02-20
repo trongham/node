@@ -58,6 +58,8 @@ static inline constexpr RegClass reg_class_for(ValueType::Kind kind) {
     case ValueType::kF32:
     case ValueType::kF64:
       return kFpReg;
+    case ValueType::kI8:
+    case ValueType::kI16:
     case ValueType::kI32:
       return kGpReg;
     case ValueType::kI64:
@@ -66,6 +68,8 @@ static inline constexpr RegClass reg_class_for(ValueType::Kind kind) {
       return kNeedS128RegPair ? kFpRegPair : kFpReg;
     case ValueType::kRef:
     case ValueType::kOptRef:
+    case ValueType::kRtt:
+    case ValueType::kRttWithDepth:
       return kGpReg;
     default:
       return kNoReg;  // unsupported type
@@ -373,6 +377,10 @@ class LiftoffRegList {
     }
     return reg;
   }
+  Register clear(Register reg) { return clear(LiftoffRegister{reg}).gp(); }
+  DoubleRegister clear(DoubleRegister reg) {
+    return clear(LiftoffRegister{reg}).fp();
+  }
 
   bool has(LiftoffRegister reg) const {
     if (reg.is_pair()) {
@@ -381,8 +389,8 @@ class LiftoffRegList {
     }
     return (regs_ & (storage_t{1} << reg.liftoff_code())) != 0;
   }
-  bool has(Register reg) const { return has(LiftoffRegister(reg)); }
-  bool has(DoubleRegister reg) const { return has(LiftoffRegister(reg)); }
+  bool has(Register reg) const { return has(LiftoffRegister{reg}); }
+  bool has(DoubleRegister reg) const { return has(LiftoffRegister{reg}); }
 
   constexpr bool is_empty() const { return regs_ == 0; }
 

@@ -19,15 +19,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "src/wasm/c-api.h"
+
 #include <cstring>
 #include <iostream>
 
-#include "src/wasm/c-api.h"
-
-#include "third_party/wasm-api/wasm.h"
-
 #include "include/libplatform/libplatform.h"
 #include "src/api/api-inl.h"
+#include "src/base/platform/wrappers.h"
 #include "src/compiler/wasm-compiler.h"
 #include "src/objects/js-collection-inl.h"
 #include "src/objects/managed.h"
@@ -39,6 +38,7 @@
 #include "src/wasm/wasm-objects.h"
 #include "src/wasm/wasm-result.h"
 #include "src/wasm/wasm-serialization.h"
+#include "third_party/wasm-api/wasm.h"
 
 #ifdef WASM_API_DEBUG
 #error "WASM_API_DEBUG is unsupported"
@@ -256,7 +256,6 @@ void Engine::operator delete(void* p) { ::operator delete(p); }
 auto Engine::make(own<Config>&& config) -> own<Engine> {
   i::FLAG_expose_gc = true;
   i::FLAG_experimental_wasm_reftypes = true;
-  i::FLAG_experimental_wasm_bigint = true;
   i::FLAG_experimental_wasm_mv = true;
   auto engine = new (std::nothrow) EngineImpl;
   if (!engine) return own<Engine>();
@@ -887,13 +886,13 @@ own<Instance> GetInstance(StoreImpl* store,
 
 own<Frame> CreateFrameFromInternal(i::Handle<i::FixedArray> frames, int index,
                                    i::Isolate* isolate, StoreImpl* store) {
-  i::Handle<i::StackTraceFrame> frame(
-      i::StackTraceFrame::cast(frames->get(index)), isolate);
-  i::Handle<i::WasmInstanceObject> instance =
-      i::StackTraceFrame::GetWasmInstance(frame);
-  uint32_t func_index = i::StackTraceFrame::GetWasmFunctionIndex(frame);
-  size_t func_offset = i::StackTraceFrame::GetFunctionOffset(frame);
-  size_t module_offset = i::StackTraceFrame::GetColumnNumber(frame);
+  i::Handle<i::StackFrameInfo> frame(
+      i::StackFrameInfo::cast(frames->get(index)), isolate);
+  i::Handle<i::WasmInstanceObject> instance(frame->GetWasmInstance(), isolate);
+  uint32_t func_index = frame->GetWasmFunctionIndex();
+  size_t module_offset = i::StackFrameInfo::GetSourcePosition(frame);
+  size_t func_offset = module_offset - i::wasm::GetWasmFunctionOffset(
+                                           instance->module(), func_index);
   return own<Frame>(seal<Frame>(new (std::nothrow) FrameImpl(
       GetInstance(store, instance), func_index, func_offset, module_offset)));
 }
@@ -1421,6 +1420,7 @@ void PushArgs(const i::wasm::FunctionSig* sig, const Val args[],
         packer->Push(WasmRefToV8(store->i_isolate(), args[i].ref())->ptr());
         break;
       case i::wasm::ValueType::kRtt:
+      case i::wasm::ValueType::kRttWithDepth:
       case i::wasm::ValueType::kS128:
         // TODO(7748): Implement.
         UNIMPLEMENTED();
@@ -1461,6 +1461,7 @@ void PopArgs(const i::wasm::FunctionSig* sig, Val results[],
         break;
       }
       case i::wasm::ValueType::kRtt:
+      case i::wasm::ValueType::kRttWithDepth:
       case i::wasm::ValueType::kS128:
         // TODO(7748): Implement.
         UNIMPLEMENTED();
@@ -1725,6 +1726,7 @@ auto Global::get() const -> Val {
       return Val(V8RefValueToWasm(store, v8_global->GetRef()));
     }
     case i::wasm::ValueType::kRtt:
+    case i::wasm::ValueType::kRttWithDepth:
     case i::wasm::ValueType::kS128:
       // TODO(7748): Implement these.
       UNIMPLEMENTED();
@@ -2212,22 +2214,22 @@ struct borrowed_vec {
   }
 
 // Vectors with no ownership management of elements
-#define WASM_DEFINE_VEC_PLAIN(name, Name)                           \
-  WASM_DEFINE_VEC_BASE(name, Name,                                  \
-                       wasm::vec, ) /* NOLINT(whitespace/parens) */ \
-                                                                    \
-  void wasm_##name##_vec_new(wasm_##name##_vec_t* out, size_t size, \
-                             const wasm_##name##_t data[]) {        \
-    auto v2 = wasm::vec<Name>::make_uninitialized(size);            \
-    if (v2.size() != 0) {                                           \
-      memcpy(v2.get(), data, size * sizeof(wasm_##name##_t));       \
-    }                                                               \
-    *out = release_##name##_vec(std::move(v2));                     \
-  }                                                                 \
-                                                                    \
-  void wasm_##name##_vec_copy(wasm_##name##_vec_t* out,             \
-                              wasm_##name##_vec_t* v) {             \
-    wasm_##name##_vec_new(out, v->size, v->data);                   \
+#define WASM_DEFINE_VEC_PLAIN(name, Name)                               \
+  WASM_DEFINE_VEC_BASE(name, Name,                                      \
+                       wasm::vec, ) /* NOLINT(whitespace/parens) */     \
+                                                                        \
+  void wasm_##name##_vec_new(wasm_##name##_vec_t* out, size_t size,     \
+                             const wasm_##name##_t data[]) {            \
+    auto v2 = wasm::vec<Name>::make_uninitialized(size);                \
+    if (v2.size() != 0) {                                               \
+      v8::base::Memcpy(v2.get(), data, size * sizeof(wasm_##name##_t)); \
+    }                                                                   \
+    *out = release_##name##_vec(std::move(v2));                         \
+  }                                                                     \
+                                                                        \
+  void wasm_##name##_vec_copy(wasm_##name##_vec_t* out,                 \
+                              wasm_##name##_vec_t* v) {                 \
+    wasm_##name##_vec_new(out, v->size, v->data);                       \
   }
 
 // Vectors that own their elements

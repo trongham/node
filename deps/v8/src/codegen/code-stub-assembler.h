@@ -21,6 +21,7 @@
 #include "src/objects/promise.h"
 #include "src/objects/shared-function-info.h"
 #include "src/objects/smi.h"
+#include "src/objects/swiss-name-dictionary.h"
 #include "src/objects/tagged-index.h"
 #include "src/roots/roots.h"
 #include "torque-generated/exported-macros-assembler.h"
@@ -132,6 +133,8 @@ enum class PrimitiveType { kBoolean, kNumber, kString, kSymbol };
   V(EmptyScopeInfo, empty_scope_info, EmptyScopeInfo)                        \
   V(EmptyPropertyDictionary, empty_property_dictionary,                      \
     EmptyPropertyDictionary)                                                 \
+  V(EmptyOrderedPropertyDictionary, empty_ordered_property_dictionary,       \
+    EmptyOrderedPropertyDictionary)                                          \
   V(EmptySlowElementDictionary, empty_slow_element_dictionary,               \
     EmptySlowElementDictionary)                                              \
   V(empty_string, empty_string, EmptyString)                                 \
@@ -186,6 +189,7 @@ enum class PrimitiveType { kBoolean, kNumber, kString, kSymbol };
   V(regexp_to_string, regexp_to_string, RegexpToString)                      \
   V(resolve_string, resolve_string, ResolveString)                           \
   V(return_string, return_string, ReturnString)                              \
+  V(search_symbol, search_symbol, SearchSymbol)                              \
   V(species_symbol, species_symbol, SpeciesSymbol)                           \
   V(StaleRegister, stale_register, StaleRegister)                            \
   V(StoreHandler0Map, store_handler0_map, StoreHandler0Map)                  \
@@ -292,13 +296,6 @@ enum class PrimitiveType { kBoolean, kNumber, kString, kSymbol };
 #define CSA_SLOW_ASSERT(csa, ...) ((void)0)
 #endif
 
-// Provides a constexpr boolean to be used inside Torque.
-#ifdef V8_NO_ARGUMENTS_ADAPTOR
-constexpr bool kNoArgumentsAdaptor = true;
-#else
-constexpr bool kNoArgumentsAdaptor = false;
-#endif
-
 // Provides JavaScript-specific "macro-assembler" functionality on top of the
 // CodeAssembler. By factoring the JavaScript-isms out of the CodeAssembler,
 // it's possible to add JavaScript-specific useful CodeAssembler "macros"
@@ -341,9 +338,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<TIndex> TaggedToParameter(TNode<Smi> value);
 
   bool ToParameterConstant(TNode<Smi> node, intptr_t* out) {
-    Smi constant;
-    if (ToSmiConstant(node, &constant)) {
-      *out = static_cast<intptr_t>(constant.value());
+    if (TryToIntPtrConstant(node, out)) {
       return true;
     }
     return false;
@@ -351,7 +346,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
 
   bool ToParameterConstant(TNode<IntPtrT> node, intptr_t* out) {
     intptr_t constant;
-    if (ToIntPtrConstant(node, &constant)) {
+    if (TryToIntPtrConstant(node, &constant)) {
       *out = constant;
       return true;
     }
@@ -1034,6 +1029,12 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
 
   TNode<RawPtrT> LoadExternalStringResourceDataPtr(
       TNode<ExternalString> object) {
+    // This is only valid for ExternalStrings where the resource data
+    // pointer is cached (i.e. no uncached external strings).
+    CSA_ASSERT(this, Word32NotEqual(
+                         Word32And(LoadInstanceType(object),
+                                   Int32Constant(kUncachedExternalStringMask)),
+                         Int32Constant(kUncachedExternalStringTag)));
     return LoadExternalPointerFromObject(object,
                                          ExternalString::kResourceDataOffset,
                                          kExternalStringResourceDataTag);
@@ -1124,14 +1125,20 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                            Map::kConstructorOrBackPointerOrNativeContextOffset);
   }
 
-  // Reference is the CSA-equivalent of a Torque reference value,
-  // representing an inner pointer into a HeapObject.
-  // TODO(gsps): Remove in favor of flattened {Load,Store}Reference interface
+  // Reference is the CSA-equivalent of a Torque reference value, representing
+  // an inner pointer into a HeapObject.
+  //
+  // The object can be a HeapObject or an all-zero bitpattern. The latter is
+  // used for off-heap data, in which case the offset holds the actual address
+  // and the data must be untagged (i.e. accessed via the Load-/StoreReference
+  // overloads for TNode<UntaggedT>-convertible types below).
+  //
+  // TODO(gsps): Remove in favor of flattened {Load,Store}Reference interface.
   struct Reference {
-    TNode<HeapObject> object;
+    TNode<Object> object;
     TNode<IntPtrT> offset;
 
-    std::tuple<TNode<HeapObject>, TNode<IntPtrT>> Flatten() const {
+    std::tuple<TNode<Object>, TNode<IntPtrT>> Flatten() const {
       return std::make_tuple(object, offset);
     }
   };
@@ -1142,6 +1149,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<T> LoadReference(Reference reference) {
     TNode<IntPtrT> offset =
         IntPtrSub(reference.offset, IntPtrConstant(kHeapObjectTag));
+    CSA_ASSERT(this, TaggedIsNotSmi(reference.object));
     return CAST(
         LoadFromObject(MachineTypeOf<T>::value, reference.object, offset));
   }
@@ -1170,6 +1178,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
     }
     TNode<IntPtrT> offset =
         IntPtrSub(reference.offset, IntPtrConstant(kHeapObjectTag));
+    CSA_ASSERT(this, TaggedIsNotSmi(reference.object));
     StoreToObject(rep, reference.object, offset, value, write_barrier);
   }
   template <class T, typename std::enable_if<
@@ -1180,6 +1189,13 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
         IntPtrSub(reference.offset, IntPtrConstant(kHeapObjectTag));
     StoreToObject(MachineRepresentationOf<T>::value, reference.object, offset,
                   value, StoreToObjectWriteBarrier::kNone);
+  }
+
+  TNode<RawPtrT> GCUnsafeReferenceToRawPtr(TNode<Object> object,
+                                           TNode<IntPtrT> offset) {
+    return ReinterpretCast<RawPtrT>(
+        IntPtrAdd(BitcastTaggedToWord(object),
+                  IntPtrSub(offset, IntPtrConstant(kHeapObjectTag))));
   }
 
   // Load the floating point value of a HeapNumber.
@@ -1461,6 +1477,8 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   // Calling this is only valid if there's a module context in the chain.
   TNode<Context> LoadModuleContext(TNode<Context> context);
 
+  TNode<Object> GetImportMetaObject(TNode<Context> context);
+
   void GotoIfContextElementEqual(SloppyTNode<Object> value,
                                  TNode<NativeContext> native_context,
                                  int slot_index, Label* if_equal) {
@@ -1508,7 +1526,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                                       SloppyTNode<IntPtrT> offset,
                                       TNode<T> value) {
     int const_offset;
-    if (ToInt32Constant(offset, &const_offset)) {
+    if (TryToInt32Constant(offset, &const_offset)) {
       return StoreObjectFieldNoWriteBarrier<T>(object, const_offset, value);
     }
     StoreNoWriteBarrier(MachineRepresentationOf<T>::value, object,
@@ -1537,37 +1555,43 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   void StoreMapNoWriteBarrier(TNode<HeapObject> object, TNode<Map> map);
   void StoreObjectFieldRoot(TNode<HeapObject> object, int offset,
                             RootIndex root);
+
   // Store an array element to a FixedArray.
   void StoreFixedArrayElement(
-      TNode<FixedArray> object, int index, SloppyTNode<Object> value,
+      TNode<FixedArray> object, int index, TNode<Object> value,
       WriteBarrierMode barrier_mode = UPDATE_WRITE_BARRIER,
       CheckBounds check_bounds = CheckBounds::kAlways) {
     return StoreFixedArrayElement(object, IntPtrConstant(index), value,
                                   barrier_mode, 0, check_bounds);
   }
+
   // This doesn't emit a bounds-check. As part of the security-performance
   // tradeoff, only use it if it is performance critical.
   void UnsafeStoreFixedArrayElement(
       TNode<FixedArray> object, int index, TNode<Object> value,
       WriteBarrierMode barrier_mode = UPDATE_WRITE_BARRIER) {
-    return StoreFixedArrayElement(object, index, value, barrier_mode,
-                                  CheckBounds::kDebugOnly);
+    return StoreFixedArrayElement(object, IntPtrConstant(index), value,
+                                  barrier_mode, 0, CheckBounds::kDebugOnly);
   }
+
   void UnsafeStoreFixedArrayElement(TNode<FixedArray> object, int index,
                                     TNode<Smi> value) {
-    return StoreFixedArrayElement(object, index, value,
-                                  UNSAFE_SKIP_WRITE_BARRIER,
+    return StoreFixedArrayElement(object, IntPtrConstant(index), value,
+                                  UNSAFE_SKIP_WRITE_BARRIER, 0,
                                   CheckBounds::kDebugOnly);
   }
+
   void StoreFixedArrayElement(TNode<FixedArray> object, int index,
                               TNode<Smi> value,
                               CheckBounds check_bounds = CheckBounds::kAlways) {
-    return StoreFixedArrayElement(object, IntPtrConstant(index), value,
+    return StoreFixedArrayElement(object, IntPtrConstant(index),
+                                  TNode<Object>{value},
                                   UNSAFE_SKIP_WRITE_BARRIER, 0, check_bounds);
   }
+
   template <typename TIndex>
   void StoreFixedArrayElement(
-      TNode<FixedArray> array, TNode<TIndex> index, SloppyTNode<Object> value,
+      TNode<FixedArray> array, TNode<TIndex> index, TNode<Object> value,
       WriteBarrierMode barrier_mode = UPDATE_WRITE_BARRIER,
       int additional_offset = 0,
       CheckBounds check_bounds = CheckBounds::kAlways) {
@@ -1582,6 +1606,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
     StoreFixedArrayOrPropertyArrayElement(array, index, value, barrier_mode,
                                           additional_offset);
   }
+
   // This doesn't emit a bounds-check. As part of the security-performance
   // tradeoff, only use it if it is performance critical.
   void UnsafeStoreFixedArrayElement(
@@ -1606,24 +1631,12 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                                           UPDATE_WRITE_BARRIER);
   }
 
-  void StoreFixedArrayElement(
-      TNode<FixedArray> array, TNode<Smi> index, TNode<Object> value,
-      WriteBarrierMode barrier_mode = UPDATE_WRITE_BARRIER) {
-    StoreFixedArrayElement(array, index, value, barrier_mode, 0);
-  }
-  void StoreFixedArrayElement(
-      TNode<FixedArray> array, TNode<IntPtrT> index, TNode<Smi> value,
-      WriteBarrierMode barrier_mode = SKIP_WRITE_BARRIER,
-      int additional_offset = 0) {
-    DCHECK_EQ(SKIP_WRITE_BARRIER, barrier_mode);
-    StoreFixedArrayElement(array, index, TNode<Object>{value},
-                           UNSAFE_SKIP_WRITE_BARRIER, additional_offset);
-  }
-  void StoreFixedArrayElement(
-      TNode<FixedArray> array, TNode<Smi> index, TNode<Smi> value,
-      WriteBarrierMode barrier_mode = SKIP_WRITE_BARRIER,
-      int additional_offset = 0) {
-    DCHECK_EQ(SKIP_WRITE_BARRIER, barrier_mode);
+  template <typename TIndex>
+  void StoreFixedArrayElement(TNode<FixedArray> array, TNode<TIndex> index,
+                              TNode<Smi> value, int additional_offset = 0) {
+    static_assert(std::is_same<TIndex, Smi>::value ||
+                      std::is_same<TIndex, IntPtrT>::value,
+                  "Only Smi or IntPtrT indeces is allowed");
     StoreFixedArrayElement(array, index, TNode<Object>{value},
                            UNSAFE_SKIP_WRITE_BARRIER, additional_offset);
   }
@@ -1737,8 +1750,15 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<NameDictionary> CopyNameDictionary(TNode<NameDictionary> dictionary,
                                            Label* large_object_fallback);
 
-  template <typename CollectionType>
-  TNode<CollectionType> AllocateOrderedHashTable();
+  TNode<OrderedHashSet> AllocateOrderedHashSet();
+
+  TNode<OrderedHashMap> AllocateOrderedHashMap();
+
+  // Allocates an OrderedNameDictionary of the given capacity. This guarantees
+  // that |capacity| entries can be added without reallocating.
+  TNode<OrderedNameDictionary> AllocateOrderedNameDictionary(
+      TNode<IntPtrT> capacity);
+  TNode<OrderedNameDictionary> AllocateOrderedNameDictionary(int capacity);
 
   TNode<JSObject> AllocateJSObjectFromMap(
       TNode<Map> map,
@@ -2145,10 +2165,12 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   // (NOTE: not index!), does a hole check if |if_hole| is provided and
   // converts the value so that it becomes ready for storing to array of
   // |to_kind| elements.
-  Node* LoadElementAndPrepareForStore(TNode<FixedArrayBase> array,
-                                      TNode<IntPtrT> offset,
-                                      ElementsKind from_kind,
-                                      ElementsKind to_kind, Label* if_hole);
+  template <typename TResult>
+  TNode<TResult> LoadElementAndPrepareForStore(TNode<FixedArrayBase> array,
+                                               TNode<IntPtrT> offset,
+                                               ElementsKind from_kind,
+                                               ElementsKind to_kind,
+                                               Label* if_hole);
 
   template <typename TIndex>
   TNode<TIndex> CalculateNewElementsCapacity(TNode<TIndex> old_capacity);
@@ -2319,6 +2341,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsConstructor(TNode<HeapObject> object);
   TNode<BoolT> IsDeprecatedMap(TNode<Map> map);
   TNode<BoolT> IsNameDictionary(TNode<HeapObject> object);
+  TNode<BoolT> IsOrderedNameDictionary(TNode<HeapObject> object);
   TNode<BoolT> IsGlobalDictionary(TNode<HeapObject> object);
   TNode<BoolT> IsExtensibleMap(TNode<Map> map);
   TNode<BoolT> IsExtensibleNonPrototypeMap(TNode<Map> map);
@@ -2343,6 +2366,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsJSArray(TNode<HeapObject> object);
   TNode<BoolT> IsJSArrayIterator(TNode<HeapObject> object);
   TNode<BoolT> IsJSAsyncGeneratorObject(TNode<HeapObject> object);
+  TNode<BoolT> IsFunctionInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsJSFunctionInstanceType(SloppyTNode<Int32T> instance_type);
   TNode<BoolT> IsJSFunctionMap(TNode<Map> map);
   TNode<BoolT> IsJSFunction(TNode<HeapObject> object);
@@ -2426,13 +2450,21 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsRegExpSpeciesProtectorCellInvalid();
   TNode<BoolT> IsPromiseSpeciesProtectorCellInvalid();
 
-  TNode<BoolT> IsMockArrayBufferAllocatorFlag() {
-    TNode<Word32T> flag_value = UncheckedCast<Word32T>(Load(
-        MachineType::Uint8(),
-        ExternalConstant(
-            ExternalReference::address_of_mock_arraybuffer_allocator_flag())));
+  TNode<BoolT> LoadRuntimeFlag(ExternalReference address_of_flag) {
+    TNode<Word32T> flag_value = UncheckedCast<Word32T>(
+        Load(MachineType::Uint8(), ExternalConstant(address_of_flag)));
     return Word32NotEqual(Word32And(flag_value, Int32Constant(0xFF)),
                           Int32Constant(0));
+  }
+
+  TNode<BoolT> IsMockArrayBufferAllocatorFlag() {
+    return LoadRuntimeFlag(
+        ExternalReference::address_of_mock_arraybuffer_allocator_flag());
+  }
+
+  TNode<BoolT> HasBuiltinSubclassingFlag() {
+    return LoadRuntimeFlag(
+        ExternalReference::address_of_builtin_subclassing_flag());
   }
 
   // True iff |object| is a Smi or a HeapNumber or a BigInt.
@@ -2504,7 +2536,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
 
   // String helpers.
   // Load a character from a String (might flatten a ConsString).
-  TNode<Int32T> StringCharCodeAt(TNode<String> string, TNode<UintPtrT> index);
+  TNode<Uint16T> StringCharCodeAt(TNode<String> string, TNode<UintPtrT> index);
   // Return the single character string with only {code}.
   TNode<String> StringFromSingleCharCode(TNode<Int32T> code);
 
@@ -2528,10 +2560,14 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   // With {bigint_handling} == kConvertToNumber, matches behavior of
   // tc39.github.io/proposal-bigint/#sec-number-constructor-number-value.
   TNode<Number> ToNumber(
-      TNode<Context> context, SloppyTNode<Object> input,
+      TNode<Context> context, TNode<Object> input,
       BigIntHandling bigint_handling = BigIntHandling::kThrow);
   TNode<Number> ToNumber_Inline(TNode<Context> context,
                                 SloppyTNode<Object> input);
+  TNode<Numeric> ToNumberOrNumeric(
+      LazyNode<Context> context, TNode<Object> input,
+      TVariable<Smi>* var_type_feedback, Object::Conversion mode,
+      BigIntHandling bigint_handling = BigIntHandling::kThrow);
   // Convert any plain primitive to a Number. No need to handle BigInts since
   // they are not plain primitives.
   TNode<Number> PlainPrimitiveToNumber(TNode<Object> input);
@@ -2750,6 +2786,18 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                  TVariable<Name>* var_unique, Label* if_bailout,
                  Label* if_notinternalized = nullptr);
 
+  // Call non-allocating runtime String::WriteToFlat using fast C-calls.
+  void StringWriteToFlatOneByte(TNode<String> source, TNode<RawPtrT> sink,
+                                TNode<Int32T> from, TNode<Int32T> to);
+  void StringWriteToFlatTwoByte(TNode<String> source, TNode<RawPtrT> sink,
+                                TNode<Int32T> from, TNode<Int32T> to);
+
+  // Calls External{One,Two}ByteString::GetChars with a fast C-call.
+  TNode<RawPtr<Uint8T>> ExternalOneByteStringGetChars(
+      TNode<ExternalOneByteString> string);
+  TNode<RawPtr<Uint16T>> ExternalTwoByteStringGetChars(
+      TNode<ExternalTwoByteString> string);
+
   // Performs a hash computation and string table lookup for the given string,
   // and jumps to:
   // - |if_index| if the string is an array index like "123"; |var_index|
@@ -2809,8 +2857,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
     const int kKeyToDetailsOffset =
         (ContainerType::kEntryDetailsIndex - ContainerType::kEntryKeyIndex) *
         kTaggedSize;
-    StoreFixedArrayElement(container, key_index, details, SKIP_WRITE_BARRIER,
-                           kKeyToDetailsOffset);
+    StoreFixedArrayElement(container, key_index, details, kKeyToDetailsOffset);
   }
 
   // Stores the value for the entry with the given key_index.
@@ -2830,10 +2877,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<IntPtrT> HashTableComputeCapacity(TNode<IntPtrT> at_least_space_for);
 
   template <class Dictionary>
-  TNode<Smi> GetNumberOfElements(TNode<Dictionary> dictionary) {
-    return CAST(
-        LoadFixedArrayElement(dictionary, Dictionary::kNumberOfElementsIndex));
-  }
+  TNode<Smi> GetNumberOfElements(TNode<Dictionary> dictionary);
 
   TNode<Smi> GetNumberDictionaryNumberOfElements(
       TNode<NumberDictionary> dictionary) {
@@ -2977,6 +3021,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                                   TNode<HeapObject> heap_obj,
                                   Label* if_iteratorundefined);
 
+  TNode<Object> CreateAsyncFromSyncIterator(TNode<Context> context,
+                                            TNode<Object> sync_iterator);
+
   template <class... TArgs>
   TNode<Object> CallBuiltin(Builtins::Name id, SloppyTNode<Object> context,
                             TArgs... args) {
@@ -3033,13 +3080,15 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
 
   // This is a building block for TryLookupProperty() above. Supports only
   // non-special fast and dictionary objects.
+  // TODO(v8:11167, v8:11177) |bailout| only needed for SetDataProperties
+  // workaround.
   void TryLookupPropertyInSimpleObject(TNode<JSObject> object, TNode<Map> map,
                                        TNode<Name> unique_name,
                                        Label* if_found_fast,
                                        Label* if_found_dict,
                                        TVariable<HeapObject>* var_meta_storage,
                                        TVariable<IntPtrT>* var_name_index,
-                                       Label* if_not_found);
+                                       Label* if_not_found, Label* bailout);
 
   // This method jumps to if_found if the element is known to exist. To
   // if_absent if it's known to not exist. To if_not_found if the prototype
@@ -3084,7 +3133,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
       TNode<Object> receiver, TNode<Object> object, TNode<Object> key,
       const LookupPropertyInHolder& lookup_property_in_holder,
       const LookupElementInHolder& lookup_element_in_holder, Label* if_end,
-      Label* if_bailout, Label* if_proxy);
+      Label* if_bailout, Label* if_proxy, bool handle_private_names = false);
 
   // Instanceof helpers.
   // Returns true if {object} has {prototype} somewhere in it's prototype
@@ -3100,6 +3149,11 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
 
   // Load type feedback vector from the stub caller's frame.
   TNode<FeedbackVector> LoadFeedbackVectorForStub();
+  TNode<FeedbackVector> LoadFeedbackVectorFromBaseline();
+  TNode<Context> LoadContextFromBaseline();
+  // Load type feedback vector from the stub caller's frame, skipping an
+  // intermediate trampoline frame.
+  TNode<FeedbackVector> LoadFeedbackVectorForStubWithTrampoline();
 
   // Load the value from closure's feedback cell.
   TNode<HeapObject> LoadFeedbackCellValue(TNode<JSFunction> closure);
@@ -3117,9 +3171,18 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
       TNode<JSFunction> closure);
 
   // Update the type feedback vector.
+  bool UpdateFeedbackModeEqual(UpdateFeedbackMode a, UpdateFeedbackMode b) {
+    return a == b;
+  }
   void UpdateFeedback(TNode<Smi> feedback,
                       TNode<HeapObject> maybe_feedback_vector,
+                      TNode<UintPtrT> slot_id, UpdateFeedbackMode mode);
+  void UpdateFeedback(TNode<Smi> feedback,
+                      TNode<FeedbackVector> feedback_vector,
                       TNode<UintPtrT> slot_id);
+  void MaybeUpdateFeedback(TNode<Smi> feedback,
+                           TNode<HeapObject> maybe_feedback_vector,
+                           TNode<UintPtrT> slot_id);
 
   // Report that there was a feedback update, performing any tasks that should
   // be done after a feedback update.
@@ -3268,9 +3331,25 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                                 TNode<IntPtrT> start_offset,
                                 TNode<IntPtrT> end_offset, RootIndex root);
 
+  // Goto the given |target| if the context chain starting at |context| has any
+  // extensions up to the given |depth|. Returns the Context with the
+  // extensions if there was one, otherwise returns the Context at the given
+  // |depth|.
+  TNode<Context> GotoIfHasContextExtensionUpToDepth(TNode<Context> context,
+                                                    TNode<Uint32T> depth,
+                                                    Label* target);
+
   TNode<Oddball> RelationalComparison(
       Operation op, TNode<Object> left, TNode<Object> right,
-      TNode<Context> context, TVariable<Smi>* var_type_feedback = nullptr);
+      TNode<Context> context, TVariable<Smi>* var_type_feedback = nullptr) {
+    return RelationalComparison(
+        op, left, right, [=]() { return context; }, var_type_feedback);
+  }
+
+  TNode<Oddball> RelationalComparison(
+      Operation op, TNode<Object> left, TNode<Object> right,
+      const LazyNode<Context>& context,
+      TVariable<Smi>* var_type_feedback = nullptr);
 
   void BranchIfNumberRelationalComparison(Operation op, TNode<Number> left,
                                           TNode<Number> right, Label* if_true,
@@ -3322,6 +3401,12 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
 
   TNode<Oddball> Equal(SloppyTNode<Object> lhs, SloppyTNode<Object> rhs,
                        TNode<Context> context,
+                       TVariable<Smi>* var_type_feedback = nullptr) {
+    return Equal(
+        lhs, rhs, [=]() { return context; }, var_type_feedback);
+  }
+  TNode<Oddball> Equal(SloppyTNode<Object> lhs, SloppyTNode<Object> rhs,
+                       const LazyNode<Context>& context,
                        TVariable<Smi>* var_type_feedback = nullptr);
 
   TNode<Oddball> StrictEqual(SloppyTNode<Object> lhs, SloppyTNode<Object> rhs,
@@ -3357,14 +3442,8 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   void ForInPrepare(TNode<HeapObject> enumerator, TNode<UintPtrT> slot,
                     TNode<HeapObject> maybe_feedback_vector,
                     TNode<FixedArray>* cache_array_out,
-                    TNode<Smi>* cache_length_out);
-  // Returns {cache_array} and {cache_length} in a fixed array of length 2.
-  // TODO(jgruber): Tuple2 would be a slightly better fit as the return type,
-  // but FixedArray has better support and there are no effective drawbacks to
-  // using it instead of Tuple2 in practice.
-  TNode<FixedArray> ForInPrepareForTorque(
-      TNode<HeapObject> enumerator, TNode<UintPtrT> slot,
-      TNode<HeapObject> maybe_feedback_vector);
+                    TNode<Smi>* cache_length_out,
+                    UpdateFeedbackMode update_feedback_mode);
 
   TNode<String> Typeof(SloppyTNode<Object> value);
 
@@ -3592,20 +3671,12 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   using ForEachKeyValueFunction =
       std::function<void(TNode<Name> key, TNode<Object> value)>;
 
-  enum ForEachEnumerationMode {
-    // String and then Symbol properties according to the spec
-    // ES#sec-object.assign
-    kEnumerationOrder,
-    // Order of property addition
-    kPropertyAdditionOrder,
-  };
-
   // For each JSObject property (in DescriptorArray order), check if the key is
   // enumerable, and if so, load the value from the receiver and evaluate the
   // closure.
   void ForEachEnumerableOwnProperty(TNode<Context> context, TNode<Map> map,
                                     TNode<JSObject> object,
-                                    ForEachEnumerationMode mode,
+                                    PropertiesEnumerationMode mode,
                                     const ForEachKeyValueFunction& body,
                                     Label* bailout);
 
@@ -3631,16 +3702,12 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
       TNode<JSFinalizationRegistry> finalization_registry,
       TNode<WeakCell> weak_cell);
 
-  TNode<IntPtrT> FeedbackIteratorSizeFor(int number_of_entries) {
-    return IntPtrConstant(FeedbackIterator::SizeFor(number_of_entries));
+  TNode<IntPtrT> FeedbackIteratorEntrySize() {
+    return IntPtrConstant(FeedbackIterator::kEntrySize);
   }
 
-  TNode<IntPtrT> FeedbackIteratorMapIndexForEntry(int entry) {
-    return IntPtrConstant(FeedbackIterator::MapIndexForEntry(entry));
-  }
-
-  TNode<IntPtrT> FeedbackIteratorHandlerIndexForEntry(int entry) {
-    return IntPtrConstant(FeedbackIterator::HandlerIndexForEntry(entry));
+  TNode<IntPtrT> FeedbackIteratorHandlerOffset() {
+    return IntPtrConstant(FeedbackIterator::kHandlerOffset);
   }
 
  private:
@@ -3667,6 +3734,15 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
       TNode<Map> array_map, TNode<Smi> length,
       base::Optional<TNode<AllocationSite>> allocation_site,
       TNode<IntPtrT> size_in_bytes);
+
+  // Increases the provided capacity to the next valid value, if necessary.
+  template <typename CollectionType>
+  TNode<CollectionType> AllocateOrderedHashTable(TNode<IntPtrT> capacity);
+
+  // Uses the provided capacity (which must be valid) in verbatim.
+  template <typename CollectionType>
+  TNode<CollectionType> AllocateOrderedHashTableWithCapacity(
+      TNode<IntPtrT> capacity);
 
   TNode<IntPtrT> SmiShiftBitsConstant() {
     return IntPtrConstant(kSmiShiftSize + kSmiTagSize);
@@ -3739,12 +3815,16 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   // TODO(solanes): This method can go away and simplify into only one version
   // of StoreElement once we have "if constexpr" available to use.
   template <typename TArray, typename TIndex>
-  void StoreElementBigIntOrTypedArray(TNode<TArray> elements, ElementsKind kind,
-                                      TNode<TIndex> index, Node* value);
+  void StoreElementTypedArray(TNode<TArray> elements, ElementsKind kind,
+                              TNode<TIndex> index, Node* value);
 
   template <typename TIndex>
   void StoreElement(TNode<FixedArrayBase> elements, ElementsKind kind,
-                    TNode<TIndex> index, Node* value);
+                    TNode<TIndex> index, TNode<Object> value);
+
+  template <typename TIndex>
+  void StoreElement(TNode<FixedArrayBase> elements, ElementsKind kind,
+                    TNode<TIndex> index, TNode<Float64T> value);
 
   // Converts {input} to a number if {input} is a plain primitve (i.e. String or
   // Oddball) and stores the result in {var_result}. Otherwise, it bails out to
@@ -3789,7 +3869,10 @@ class V8_EXPORT_PRIVATE CodeStubArguments {
   TNode<Object> AtIndex(TNode<IntPtrT> index) const;
   TNode<Object> AtIndex(int index) const;
 
+  // Return the number of arguments (excluding the receiver).
   TNode<IntPtrT> GetLength() const { return argc_; }
+  // Return the number of arguments (including the receiver).
+  TNode<IntPtrT> GetLengthWithReceiver() const;
 
   TorqueStructArguments GetTorqueArguments() const {
     return TorqueStructArguments{fp_, base_, argc_};

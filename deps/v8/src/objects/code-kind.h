@@ -27,6 +27,7 @@ namespace internal {
   V(C_WASM_ENTRY)               \
   V(INTERPRETED_FUNCTION)       \
   V(NATIVE_CONTEXT_INDEPENDENT) \
+  V(BASELINE)                   \
   V(TURBOPROP)                  \
   V(TURBOFAN)
 
@@ -47,6 +48,8 @@ static constexpr int kCodeKindCount = CODE_KIND_LIST(V);
 
 const char* CodeKindToString(CodeKind kind);
 
+const char* CodeKindToMarker(CodeKind kind);
+
 inline constexpr bool CodeKindIsInterpretedJSFunction(CodeKind kind) {
   return kind == CodeKind::INTERPRETED_FUNCTION;
 }
@@ -63,7 +66,7 @@ inline constexpr bool CodeKindIsOptimizedJSFunction(CodeKind kind) {
 }
 
 inline constexpr bool CodeKindIsJSFunction(CodeKind kind) {
-  return kind == CodeKind::INTERPRETED_FUNCTION ||
+  return CodeKindIsInterpretedJSFunction(kind) ||
          CodeKindIsOptimizedJSFunction(kind);
 }
 
@@ -84,11 +87,12 @@ inline constexpr bool CodeKindCanOSR(CodeKind kind) {
 
 inline constexpr bool CodeKindIsOptimizedAndCanTierUp(CodeKind kind) {
   return kind == CodeKind::NATIVE_CONTEXT_INDEPENDENT ||
-         (FLAG_turboprop_as_midtier && kind == CodeKind::TURBOPROP);
+         kind == CodeKind::BASELINE ||
+         (!FLAG_turboprop_as_toptier && kind == CodeKind::TURBOPROP);
 }
 
 inline constexpr bool CodeKindCanTierUp(CodeKind kind) {
-  return kind == CodeKind::INTERPRETED_FUNCTION ||
+  return CodeKindIsInterpretedJSFunction(kind) ||
          CodeKindIsOptimizedAndCanTierUp(kind);
 }
 
@@ -103,23 +107,25 @@ inline constexpr bool CodeKindIsStoredInOptimizedCodeCache(CodeKind kind) {
 inline OptimizationTier GetTierForCodeKind(CodeKind kind) {
   if (kind == CodeKind::TURBOFAN) return OptimizationTier::kTopTier;
   if (kind == CodeKind::TURBOPROP) {
-    return FLAG_turboprop_as_midtier ? OptimizationTier::kMidTier
-                                     : OptimizationTier::kTopTier;
+    return FLAG_turboprop_as_toptier ? OptimizationTier::kTopTier
+                                     : OptimizationTier::kMidTier;
   }
   if (kind == CodeKind::NATIVE_CONTEXT_INDEPENDENT) {
-    return FLAG_turbo_nci_as_midtier ? OptimizationTier::kMidTier
-                                     : OptimizationTier::kTopTier;
+    return OptimizationTier::kTopTier;
   }
   return OptimizationTier::kNone;
 }
 
 inline CodeKind CodeKindForTopTier() {
-  // TODO(turboprop, mythria): We should make FLAG_turboprop mean turboprop is
-  // mid-tier compiler and replace FLAG_turboprop_as_midtier with
-  // FLAG_turboprop_as_top_tier to tier up to only Turboprop once
-  // FLAG_turboprop_as_midtier is stable and major regressions are addressed.
+  if (V8_UNLIKELY(FLAG_turboprop_as_toptier)) {
+    return CodeKind::TURBOPROP;
+  }
+  return CodeKind::TURBOFAN;
+}
+
+inline CodeKind CodeKindForOSR() {
   if (V8_UNLIKELY(FLAG_turboprop)) {
-    return FLAG_turboprop_as_midtier ? CodeKind::TURBOFAN : CodeKind::TURBOPROP;
+    return CodeKind::TURBOPROP;
   }
   return CodeKind::TURBOFAN;
 }
@@ -145,7 +151,8 @@ DEFINE_OPERATORS_FOR_FLAGS(CodeKinds)
 
 static constexpr CodeKinds kJSFunctionCodeKindsMask{
     CodeKindFlag::INTERPRETED_FUNCTION | CodeKindFlag::TURBOFAN |
-    CodeKindFlag::NATIVE_CONTEXT_INDEPENDENT | CodeKindFlag::TURBOPROP};
+    CodeKindFlag::NATIVE_CONTEXT_INDEPENDENT | CodeKindFlag::TURBOPROP |
+    CodeKindFlag::BASELINE};
 static constexpr CodeKinds kOptimizedJSFunctionCodeKindsMask{
     CodeKindFlag::TURBOFAN | CodeKindFlag::NATIVE_CONTEXT_INDEPENDENT |
     CodeKindFlag::TURBOPROP};

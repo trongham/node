@@ -167,7 +167,7 @@ double WasmGlobalObject::GetF64() {
 }
 
 Handle<Object> WasmGlobalObject::GetRef() {
-  // We use this getter for externref, funcref, and exnref.
+  // We use this getter for externref and funcref.
   DCHECK(type().is_reference_type());
   return handle(tagged_buffer().get(offset()), GetIsolate());
 }
@@ -189,9 +189,8 @@ void WasmGlobalObject::SetF64(double value) {
 }
 
 void WasmGlobalObject::SetExternRef(Handle<Object> value) {
-  // We use this getter externref and exnref.
   DCHECK(type().is_reference_to(wasm::HeapType::kExtern) ||
-         type().is_reference_to(wasm::HeapType::kExn));
+         type().is_reference_to(wasm::HeapType::kAny));
   tagged_buffer().set(offset(), *value);
 }
 
@@ -240,6 +239,8 @@ PRIMITIVE_ACCESSORS(WasmInstanceObject, hook_on_function_call_address, Address,
                     kHookOnFunctionCallAddressOffset)
 PRIMITIVE_ACCESSORS(WasmInstanceObject, num_liftoff_function_calls_array,
                     uint32_t*, kNumLiftoffFunctionCallsArrayOffset)
+PRIMITIVE_ACCESSORS(WasmInstanceObject, break_on_entry, uint8_t,
+                    kBreakOnEntryOffset)
 
 ACCESSORS(WasmInstanceObject, module_object, WasmModuleObject,
           kModuleObjectOffset)
@@ -333,11 +334,15 @@ SMI_ACCESSORS(WasmExportedFunctionData, jump_table_offset,
               kJumpTableOffsetOffset)
 SMI_ACCESSORS(WasmExportedFunctionData, function_index, kFunctionIndexOffset)
 ACCESSORS(WasmExportedFunctionData, signature, Foreign, kSignatureOffset)
-SMI_ACCESSORS(WasmExportedFunctionData, call_count, kCallCountOffset)
+SMI_ACCESSORS(WasmExportedFunctionData, wrapper_budget, kWrapperBudgetOffset)
 ACCESSORS(WasmExportedFunctionData, c_wrapper_code, Object, kCWrapperCodeOffset)
 ACCESSORS(WasmExportedFunctionData, wasm_call_target, Object,
           kWasmCallTargetOffset)
 SMI_ACCESSORS(WasmExportedFunctionData, packed_args_size, kPackedArgsSizeOffset)
+
+wasm::FunctionSig* WasmExportedFunctionData::sig() const {
+  return reinterpret_cast<wasm::FunctionSig*>(signature().foreign_address());
+}
 
 // WasmJSFunction
 WasmJSFunction::WasmJSFunction(Address ptr) : JSFunction(ptr) {
@@ -408,7 +413,7 @@ wasm::StructType* WasmStruct::type(Map map) {
 
 wasm::StructType* WasmStruct::GcSafeType(Map map) {
   DCHECK_EQ(WASM_STRUCT_TYPE, map.instance_type());
-  HeapObject raw = HeapObject::cast(map.constructor_or_backpointer());
+  HeapObject raw = HeapObject::cast(map.constructor_or_back_pointer());
   MapWord map_word = raw.map_word();
   HeapObject forwarded =
       map_word.IsForwardingAddress() ? map_word.ToForwardingAddress() : raw;
@@ -431,7 +436,7 @@ wasm::ArrayType* WasmArray::type(Map map) {
 
 wasm::ArrayType* WasmArray::GcSafeType(Map map) {
   DCHECK_EQ(WASM_ARRAY_TYPE, map.instance_type());
-  HeapObject raw = HeapObject::cast(map.constructor_or_backpointer());
+  HeapObject raw = HeapObject::cast(map.constructor_or_back_pointer());
   MapWord map_word = raw.map_word();
   HeapObject forwarded =
       map_word.IsForwardingAddress() ? map_word.ToForwardingAddress() : raw;
@@ -443,6 +448,11 @@ wasm::ArrayType* WasmArray::type() const { return type(map()); }
 
 int WasmArray::SizeFor(Map map, int length) {
   int element_size = type(map)->element_type().element_size_bytes();
+  return kHeaderSize + RoundUp(element_size * length, kTaggedSize);
+}
+
+int WasmArray::GcSafeSizeFor(Map map, int length) {
+  int element_size = GcSafeType(map)->element_type().element_size_bytes();
   return kHeaderSize + RoundUp(element_size * length, kTaggedSize);
 }
 

@@ -33,6 +33,7 @@ constexpr int kMaxFunctions = 4;
 constexpr int kMaxGlobals = 64;
 constexpr int kMaxParameters = 15;
 constexpr int kMaxReturns = 15;
+constexpr int kMaxExceptions = 4;
 
 class DataRange {
   Vector<const uint8_t> data_;
@@ -111,13 +112,13 @@ class WasmGenerator {
     builder_->Emit(Op);
   }
 
-  class BlockScope {
+  class V8_NODISCARD BlockScope {
    public:
     BlockScope(WasmGenerator* gen, WasmOpcode block_type,
                Vector<const ValueType> param_types,
                Vector<const ValueType> result_types,
-               Vector<const ValueType> br_types)
-        : gen_(gen) {
+               Vector<const ValueType> br_types, bool emit_end = true)
+        : gen_(gen), emit_end_(emit_end) {
       gen->blocks_.emplace_back(br_types.begin(), br_types.end());
       if (param_types.size() == 0 && result_types.size() == 0) {
         gen->builder_->EmitWithU8(block_type, kWasmStmt.value_type_code());
@@ -146,12 +147,13 @@ class WasmGenerator {
     }
 
     ~BlockScope() {
-      gen_->builder_->Emit(kExprEnd);
+      if (emit_end_) gen_->builder_->Emit(kExprEnd);
       gen_->blocks_.pop_back();
     }
 
    private:
     WasmGenerator* const gen_;
+    bool emit_end_;
   };
 
   void block(Vector<const ValueType> param_types,
@@ -202,6 +204,61 @@ class WasmGenerator {
         T == ValueType::kStmt ? Vector<ValueType>{}
                               : VectorOf({ValueType::Primitive(T)}),
         type, data);
+  }
+
+  void try_block_helper(ValueType return_type, DataRange* data) {
+    bool has_catch_all = data->get<uint8_t>() % 2;
+    uint8_t num_catch =
+        data->get<uint8_t>() % (builder_->builder()->NumExceptions() + 1);
+    bool is_delegate =
+        num_catch == 0 && !has_catch_all && data->get<uint8_t>() % 2 == 0;
+    // Allow one more target than there are enclosing try blocks, for delegating
+    // to the caller.
+    uint8_t delegate_target = data->get<uint8_t>() % (try_blocks_.size() + 1);
+    bool is_unwind = num_catch == 0 && !has_catch_all && !is_delegate;
+
+    Vector<const ValueType> return_type_vec =
+        return_type.kind() == ValueType::kStmt
+            ? Vector<ValueType>{}
+            : Vector<ValueType>(&return_type, 1);
+    BlockScope block_scope(this, kExprTry, {}, return_type_vec, return_type_vec,
+                           !is_delegate);
+    int control_depth = static_cast<int>(blocks_.size()) - 1;
+    try_blocks_.push_back(control_depth);
+    Generate(return_type, data);
+    try_blocks_.pop_back();
+    catch_blocks_.push_back(control_depth);
+    for (int i = 0; i < num_catch; ++i) {
+      const FunctionSig* exception_type =
+          builder_->builder()->GetExceptionType(i);
+      auto exception_type_vec = VectorOf(exception_type->parameters().begin(),
+                                         exception_type->parameter_count());
+      builder_->EmitWithU32V(kExprCatch, i);
+      ConsumeAndGenerate(exception_type_vec, return_type_vec, data);
+    }
+    if (has_catch_all) {
+      builder_->Emit(kExprCatchAll);
+      Generate(return_type, data);
+    }
+    if (is_delegate) {
+      DCHECK_GT(blocks_.size(), try_blocks_.size());
+      // If {delegate_target == try_blocks_.size()}, delegate to the caller.
+      int delegate_depth = delegate_target == try_blocks_.size()
+                               ? static_cast<int>(blocks_.size()) - 2
+                               : static_cast<int>(blocks_.size() - 2 -
+                                                  try_blocks_[delegate_target]);
+      builder_->EmitWithU32V(kExprDelegate, delegate_depth);
+    }
+    catch_blocks_.pop_back();
+    if (is_unwind) {
+      builder_->Emit(kExprUnwind);
+      Generate(return_type, data);
+    }
+  }
+
+  template <ValueType::Kind T>
+  void try_block(DataRange* data) {
+    try_block_helper(ValueType::Primitive(T), data);
   }
 
   void any_block(Vector<const ValueType> param_types,
@@ -415,6 +472,13 @@ class WasmGenerator {
   void simd_lane_op(DataRange* data) {
     Generate<Args...>(data);
     builder_->EmitWithPrefix(Op);
+    builder_->EmitByte(data->get<byte>() % lanes);
+  }
+
+  template <WasmOpcode Op, int lanes, ValueType::Kind... Args>
+  void simd_lane_memop(DataRange* data) {
+    // Simd load/store instructions that have a lane immediate.
+    memop<Op, Args...>(data);
     builder_->EmitByte(data->get<byte>() % lanes);
   }
 
@@ -645,6 +709,25 @@ class WasmGenerator {
 
   void set_global(DataRange* data) { global_op<ValueType::kStmt>(data); }
 
+  void throw_or_rethrow(DataRange* data) {
+    bool rethrow = data->get<uint8_t>() % 2;
+    if (rethrow && !catch_blocks_.empty()) {
+      int control_depth = static_cast<int>(blocks_.size() - 1);
+      int catch_index =
+          data->get<uint8_t>() % static_cast<int>(catch_blocks_.size());
+      builder_->EmitWithU32V(kExprRethrow,
+                             control_depth - catch_blocks_[catch_index]);
+    } else {
+      int tag = data->get<uint8_t>() % builder_->builder()->NumExceptions();
+      FunctionSig* exception_sig = builder_->builder()->GetExceptionType(tag);
+      Vector<const ValueType> exception_types(
+          exception_sig->parameters().begin(),
+          exception_sig->parameter_count());
+      Generate(exception_types, data);
+      builder_->EmitWithU32V(kExprThrow, tag);
+    }
+  }
+
   template <ValueType::Kind... Types>
   void sequence(DataRange* data) {
     Generate<Types...>(data);
@@ -729,6 +812,8 @@ class WasmGenerator {
   std::vector<ValueType> globals_;
   std::vector<uint8_t> mutable_globals_;  // indexes into {globals_}.
   uint32_t recursion_depth = 0;
+  std::vector<int> try_blocks_;
+  std::vector<int> catch_blocks_;
 
   static constexpr uint32_t kMaxRecursionDepth = 64;
 
@@ -784,6 +869,14 @@ void WasmGenerator::Generate<ValueType::kStmt>(DataRange* data) {
       &WasmGenerator::memop<kExprI64AtomicStore16U, ValueType::kI64>,
       &WasmGenerator::memop<kExprI64AtomicStore32U, ValueType::kI64>,
       &WasmGenerator::memop<kExprS128StoreMem, ValueType::kS128>,
+      &WasmGenerator::simd_lane_memop<kExprS128Store8Lane, 16,
+                                      ValueType::kS128>,
+      &WasmGenerator::simd_lane_memop<kExprS128Store16Lane, 8,
+                                      ValueType::kS128>,
+      &WasmGenerator::simd_lane_memop<kExprS128Store32Lane, 4,
+                                      ValueType::kS128>,
+      &WasmGenerator::simd_lane_memop<kExprS128Store64Lane, 2,
+                                      ValueType::kS128>,
 
       &WasmGenerator::drop,
 
@@ -791,7 +884,9 @@ void WasmGenerator::Generate<ValueType::kStmt>(DataRange* data) {
       &WasmGenerator::call_indirect<ValueType::kStmt>,
 
       &WasmGenerator::set_local,
-      &WasmGenerator::set_global};
+      &WasmGenerator::set_global,
+      &WasmGenerator::throw_or_rethrow,
+      &WasmGenerator::try_block<ValueType::kStmt>};
 
   GenerateOneOf(alternatives, data);
 }
@@ -934,15 +1029,15 @@ void WasmGenerator::Generate<ValueType::kI32>(DataRange* data) {
                                 ValueType::kI32, ValueType::kI32,
                                 ValueType::kI32>,
 
-      &WasmGenerator::op_with_prefix<kExprV8x16AnyTrue, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprV128AnyTrue, ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprV8x16AllTrue, ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprI8x16BitMask, ValueType::kS128>,
-      &WasmGenerator::op_with_prefix<kExprV16x8AnyTrue, ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprV16x8AllTrue, ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprI16x8BitMask, ValueType::kS128>,
-      &WasmGenerator::op_with_prefix<kExprV32x4AnyTrue, ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprV32x4AllTrue, ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprI32x4BitMask, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprV64x2AllTrue, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2BitMask, ValueType::kS128>,
       &WasmGenerator::simd_lane_op<kExprI8x16ExtractLaneS, 16,
                                    ValueType::kS128>,
       &WasmGenerator::simd_lane_op<kExprI8x16ExtractLaneU, 16,
@@ -962,7 +1057,8 @@ void WasmGenerator::Generate<ValueType::kI32>(DataRange* data) {
       &WasmGenerator::select_with_type<ValueType::kI32>,
 
       &WasmGenerator::call<ValueType::kI32>,
-      &WasmGenerator::call_indirect<ValueType::kI32>};
+      &WasmGenerator::call_indirect<ValueType::kI32>,
+      &WasmGenerator::try_block<ValueType::kI32>};
 
   GenerateOneOf(alternatives, data);
 }
@@ -1104,7 +1200,8 @@ void WasmGenerator::Generate<ValueType::kI64>(DataRange* data) {
       &WasmGenerator::select_with_type<ValueType::kI64>,
 
       &WasmGenerator::call<ValueType::kI64>,
-      &WasmGenerator::call_indirect<ValueType::kI64>};
+      &WasmGenerator::call_indirect<ValueType::kI64>,
+      &WasmGenerator::try_block<ValueType::kI64>};
 
   GenerateOneOf(alternatives, data);
 }
@@ -1162,7 +1259,8 @@ void WasmGenerator::Generate<ValueType::kF32>(DataRange* data) {
       &WasmGenerator::select_with_type<ValueType::kF32>,
 
       &WasmGenerator::call<ValueType::kF32>,
-      &WasmGenerator::call_indirect<ValueType::kF32>};
+      &WasmGenerator::call_indirect<ValueType::kF32>,
+      &WasmGenerator::try_block<ValueType::kF32>};
 
   GenerateOneOf(alternatives, data);
 }
@@ -1220,7 +1318,8 @@ void WasmGenerator::Generate<ValueType::kF64>(DataRange* data) {
       &WasmGenerator::select_with_type<ValueType::kF64>,
 
       &WasmGenerator::call<ValueType::kF64>,
-      &WasmGenerator::call_indirect<ValueType::kF64>};
+      &WasmGenerator::call_indirect<ValueType::kF64>,
+      &WasmGenerator::try_block<ValueType::kF64>};
 
   GenerateOneOf(alternatives, data);
 }
@@ -1303,6 +1402,7 @@ void WasmGenerator::Generate<ValueType::kS128>(DataRange* data) {
                                      ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprI8x16RoundingAverageU,
                                      ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI8x16Popcnt, ValueType::kS128>,
 
       &WasmGenerator::op_with_prefix<kExprI16x8Splat, ValueType::kI32>,
       &WasmGenerator::op_with_prefix<kExprI16x8Eq, ValueType::kS128,
@@ -1357,6 +1457,16 @@ void WasmGenerator::Generate<ValueType::kS128>(DataRange* data) {
                                      ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprI16x8RoundingAverageU,
                                      ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI16x8ExtMulLowI8x16S,
+                                     ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI16x8ExtMulLowI8x16U,
+                                     ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI16x8ExtMulHighI8x16S,
+                                     ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI16x8ExtMulHighI8x16U,
+                                     ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI16x8Q15MulRSatS, ValueType::kS128,
+                                     ValueType::kS128>,
 
       &WasmGenerator::op_with_prefix<kExprI32x4Splat, ValueType::kI32>,
       &WasmGenerator::op_with_prefix<kExprI32x4Eq, ValueType::kS128,
@@ -1403,8 +1513,29 @@ void WasmGenerator::Generate<ValueType::kS128>(DataRange* data) {
                                      ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprI32x4DotI16x8S, ValueType::kS128,
                                      ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI32x4ExtMulLowI16x8S,
+                                     ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI32x4ExtMulLowI16x8U,
+                                     ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI32x4ExtMulHighI16x8S,
+                                     ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI32x4ExtMulHighI16x8U,
+                                     ValueType::kS128, ValueType::kS128>,
 
       &WasmGenerator::op_with_prefix<kExprI64x2Splat, ValueType::kI64>,
+      &WasmGenerator::op_with_prefix<kExprI64x2Eq, ValueType::kS128,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2Ne, ValueType::kS128,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2LtS, ValueType::kS128,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2GtS, ValueType::kS128,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2LeS, ValueType::kS128,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2GeS, ValueType::kS128,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2Abs, ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprI64x2Neg, ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprI64x2Shl, ValueType::kS128,
                                      ValueType::kI32>,
@@ -1418,6 +1549,14 @@ void WasmGenerator::Generate<ValueType::kS128>(DataRange* data) {
                                      ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprI64x2Mul, ValueType::kS128,
                                      ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2ExtMulLowI32x4S,
+                                     ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2ExtMulLowI32x4U,
+                                     ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2ExtMulHighI32x4S,
+                                     ValueType::kS128, ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2ExtMulHighI32x4U,
+                                     ValueType::kS128, ValueType::kS128>,
 
       &WasmGenerator::op_with_prefix<kExprF32x4Splat, ValueType::kF32>,
       &WasmGenerator::op_with_prefix<kExprF32x4Eq, ValueType::kS128,
@@ -1493,6 +1632,28 @@ void WasmGenerator::Generate<ValueType::kS128>(DataRange* data) {
       &WasmGenerator::op_with_prefix<kExprF64x2Trunc, ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprF64x2NearestInt, ValueType::kS128>,
 
+      &WasmGenerator::op_with_prefix<kExprF64x2PromoteLowF32x4,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprF64x2ConvertLowI32x4S,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprF64x2ConvertLowI32x4U,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprF32x4DemoteF64x2Zero,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI32x4TruncSatF64x2SZero,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI32x4TruncSatF64x2UZero,
+                                     ValueType::kS128>,
+
+      &WasmGenerator::op_with_prefix<kExprI64x2SConvertI32x4Low,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2SConvertI32x4High,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2UConvertI32x4Low,
+                                     ValueType::kS128>,
+      &WasmGenerator::op_with_prefix<kExprI64x2UConvertI32x4High,
+                                     ValueType::kS128>,
+
       &WasmGenerator::op_with_prefix<kExprI32x4SConvertF32x4, ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprI32x4UConvertF32x4, ValueType::kS128>,
       &WasmGenerator::op_with_prefix<kExprF32x4SConvertI32x4, ValueType::kS128>,
@@ -1553,6 +1714,10 @@ void WasmGenerator::Generate<ValueType::kS128>(DataRange* data) {
       &WasmGenerator::memop<kExprS128Load64Splat>,
       &WasmGenerator::memop<kExprS128Load32Zero>,
       &WasmGenerator::memop<kExprS128Load64Zero>,
+      &WasmGenerator::simd_lane_memop<kExprS128Load8Lane, 16, ValueType::kS128>,
+      &WasmGenerator::simd_lane_memop<kExprS128Load16Lane, 8, ValueType::kS128>,
+      &WasmGenerator::simd_lane_memop<kExprS128Load32Lane, 4, ValueType::kS128>,
+      &WasmGenerator::simd_lane_memop<kExprS128Load64Lane, 2, ValueType::kS128>,
   };
 
   GenerateOneOf(alternatives, data);
@@ -1656,10 +1821,14 @@ void WasmGenerator::ConsumeAndGenerate(Vector<const ValueType> param_types,
   }
 }
 
-FunctionSig* GenerateSig(Zone* zone, DataRange* data) {
+enum SigKind { kFunctionSig, kExceptionSig };
+
+FunctionSig* GenerateSig(Zone* zone, DataRange* data, SigKind sig_kind) {
   // Generate enough parameters to spill some to the stack.
   int num_params = int{data->get<uint8_t>()} % (kMaxParameters + 1);
-  int num_returns = int{data->get<uint8_t>()} % (kMaxReturns + 1);
+  int num_returns = sig_kind == kFunctionSig
+                        ? int{data->get<uint8_t>()} % (kMaxReturns + 1)
+                        : 0;
 
   FunctionSig::Builder builder(zone, num_returns, num_params);
   for (int i = 0; i < num_returns; ++i) builder.AddReturn(GetValueType(data));
@@ -1687,7 +1856,7 @@ class WasmCompileFuzzer : public WasmExecutionFuzzer {
     int num_functions = 1 + (range.get<uint8_t>() % kMaxFunctions);
 
     for (int i = 1; i < num_functions; ++i) {
-      FunctionSig* sig = GenerateSig(zone, &range);
+      FunctionSig* sig = GenerateSig(zone, &range, kFunctionSig);
       uint32_t signature_index = builder.AddSignature(sig);
       function_signatures.push_back(signature_index);
     }
@@ -1697,6 +1866,12 @@ class WasmCompileFuzzer : public WasmExecutionFuzzer {
     std::vector<uint8_t> mutable_globals;
     globals.reserve(num_globals);
     mutable_globals.reserve(num_globals);
+
+    int num_exceptions = 1 + (range.get<uint8_t>() % kMaxExceptions);
+    for (int i = 0; i < num_exceptions; ++i) {
+      FunctionSig* sig = GenerateSig(zone, &range, kExceptionSig);
+      builder.AddException(sig);
+    }
 
     for (int i = 0; i < num_globals; ++i) {
       ValueType type = GetValueType(&range);
@@ -1749,6 +1924,7 @@ class WasmCompileFuzzer : public WasmExecutionFuzzer {
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   constexpr bool require_valid = true;
   EXPERIMENTAL_FLAG_SCOPE(reftypes);
+  EXPERIMENTAL_FLAG_SCOPE(eh);
   WasmCompileFuzzer().FuzzWasmModule({data, size}, require_valid);
   return 0;
 }

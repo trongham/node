@@ -112,6 +112,7 @@ class JSReceiver : public HeapObject {
   // maybe_excluded_properties list.
   V8_WARN_UNUSED_RESULT static Maybe<bool> SetOrCopyDataProperties(
       Isolate* isolate, Handle<JSReceiver> target, Handle<Object> source,
+      PropertiesEnumerationMode mode,
       const ScopedVector<Handle<Object>>* excluded_properties = nullptr,
       bool use_set = true);
 
@@ -226,7 +227,7 @@ class JSReceiver : public HeapObject {
   // returned instead.
   static Handle<String> GetConstructorName(Handle<JSReceiver> receiver);
 
-  V8_EXPORT_PRIVATE Handle<NativeContext> GetCreationContext();
+  V8_EXPORT_PRIVATE MaybeHandle<NativeContext> GetCreationContext();
 
   V8_WARN_UNUSED_RESULT static inline Maybe<PropertyAttributes>
   GetPropertyAttributes(Handle<JSReceiver> object, Handle<Name> name);
@@ -629,26 +630,18 @@ class JSObject : public TorqueGeneratedJSObject<JSObject, JSReceiver> {
                                                   int unused_property_fields,
                                                   const char* reason);
 
-  inline bool IsUnboxedDoubleField(FieldIndex index) const;
-  inline bool IsUnboxedDoubleField(IsolateRoot isolate, FieldIndex index) const;
-
   // Access fast-case object properties at index.
   static Handle<Object> FastPropertyAt(Handle<JSObject> object,
                                        Representation representation,
                                        FieldIndex index);
   inline Object RawFastPropertyAt(FieldIndex index) const;
   inline Object RawFastPropertyAt(IsolateRoot isolate, FieldIndex index) const;
-  inline double RawFastDoublePropertyAt(FieldIndex index) const;
-  inline uint64_t RawFastDoublePropertyAsBitsAt(FieldIndex index) const;
 
-  inline void FastPropertyAtPut(FieldIndex index, Object value);
-  inline void RawFastPropertyAtPut(
-      FieldIndex index, Object value,
-      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline void FastPropertyAtPut(FieldIndex index, Object value,
+                                WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
   inline void RawFastInobjectPropertyAtPut(
       FieldIndex index, Object value,
       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
-  inline void RawFastDoublePropertyAsBitsAtPut(FieldIndex index, uint64_t bits);
   inline void WriteToField(InternalIndex descriptor, PropertyDetails details,
                            Object value);
 
@@ -966,9 +959,7 @@ class JSGlobalObject : public JSSpecialObject {
   // [global proxy]: the global proxy object of the context
   DECL_ACCESSORS(global_proxy, JSGlobalProxy)
 
-  // Gets global object properties.
-  DECL_GETTER(global_dictionary, GlobalDictionary)
-  inline void set_global_dictionary(GlobalDictionary dictionary);
+  DECL_RELEASE_ACQUIRE_ACCESSORS(global_dictionary, GlobalDictionary)
 
   static void InvalidatePropertyCell(Handle<JSGlobalObject> object,
                                      Handle<Name> name);

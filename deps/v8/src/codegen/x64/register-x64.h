@@ -82,6 +82,13 @@ constexpr RegList kJSCallerSaved =
                      rbx,  // used as a caller-saved register in JavaScript code
                      rdi);  // callee function
 
+constexpr RegList kCallerSaved =
+#ifdef V8_TARGET_OS_WIN
+    Register::ListOf(rax, rcx, rdx, r8, r9, r10, r11);
+#else
+    Register::ListOf(rax, rcx, rdx, rdi, rsi, r8, r9, r10, r11);
+#endif  // V8_TARGET_OS_WIN
+
 constexpr int kNumJSCallerSaved = 5;
 
 // Number of registers for which space is reserved in safepoints.
@@ -139,7 +146,12 @@ constexpr Register arg_reg_4 = rcx;
   V(xmm13)                              \
   V(xmm14)
 
-constexpr bool kPadArguments = false;
+// Returns the number of padding slots needed for stack pointer alignment.
+constexpr int ArgumentPaddingSlots(int argument_count) {
+  // No argument padding required.
+  return 0;
+}
+
 constexpr bool kSimpleFPAliasing = true;
 constexpr bool kSimdMaskRegisters = false;
 
